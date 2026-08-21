@@ -38,6 +38,8 @@ dependencies = [
     "uvloop>=0.22.1; platform_system != 'Windows'",
     "asgi-correlation-id>=4.3.4",
     "alembic>=1.18.4",
+    "redis>=7.4.0",
+    "valkey[libvalkey]>=6.1.0",
 ]
 [project.optional-dependencies]
 dev = [

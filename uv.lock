@@ -3179,6 +3179,7 @@ dependencies = [
     { name = "python-dotenv" },
     { name = "python-jose", extra = ["cryptography"] },
     { name = "python-multipart" },
+    { name = "redis" },
     { name = "slowapi" },
     { name = "sqlmodel" },
     { name = "starlette-prometheus" },
@@ -3188,6 +3189,7 @@ dependencies = [
     { name = "tqdm" },
     { name = "uvicorn" },
     { name = "uvloop", marker = "sys_platform != 'win32'" },
+    { name = "valkey", extra = ["libvalkey"] },
 ]
 
 [package.optional-dependencies]
@@ -3249,6 +3251,7 @@ requires-dist = [
     { name = "python-dotenv", specifier = ">=1.1.0" },
     { name = "python-jose", extras = ["cryptography"], specifier = ">=3.4.0" },
     { name = "python-multipart", specifier = ">=0.0.20" },
+    { name = "redis", specifier = ">=7.4.0" },
     { name = "redis", marker = "extra == 'cache'", specifier = ">=7.4.0" },
     { name = "ruff", marker = "extra == 'dev'" },
     { name = "slowapi", specifier = ">=0.1.9" },
@@ -3260,6 +3263,7 @@ requires-dist = [
     { name = "tqdm", specifier = ">=4.67.1" },
     { name = "uvicorn", specifier = ">=0.34.0" },
     { name = "uvloop", marker = "sys_platform != 'win32'", specifier = ">=0.22.1" },
+    { name = "valkey", extras = ["libvalkey"], specifier = ">=6.1.0" },
     { name = "valkey", extras = ["libvalkey"], marker = "extra == 'cache'", specifier = ">=6.1.0" },
 ]
 provides-extras = ["dev", "cache"]
