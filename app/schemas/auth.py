@@ -93,8 +93,8 @@ class UserCreate(BaseModel):
 class UserResponse(BaseResponse):
     """Response model for user operations.
 
-    Attributes:
         id: User's ID
+    Attributes:
         email: User's email address
         username: Optional display name
         token: Authentication token

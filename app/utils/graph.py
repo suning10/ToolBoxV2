@@ -1,3 +1,8 @@
+import hashlib
+import json
+from typing import Optional
+import difflib
+
 import tiktoken
 from langchain_core.messages import BaseMessage
 from langchain_core.messages import trim_messages as _trim_messages
@@ -5,6 +10,7 @@ from langchain_core.messages import trim_messages as _trim_messages
 from app.core.config import settings
 from app.core.logging import logger
 from app.schemas import Message
+from app.schemas.graph import ToolCallRecord
 
 # Cache tiktoken encoding at module level — thread-safe and reusable
 try:
@@ -132,3 +138,80 @@ def prepare_messages(messages: list[Message], system_prompt: str) -> list[Messag
             raise
 
     return [Message(role="system", content=system_prompt)] + trimmed_messages
+
+def compute_call_signature(name: str, args: dict) -> str:
+    """Stable short hash of a canonicalized (tool name, args) pair.
+
+    Args:
+        name: The tool name.
+        args: The tool call arguments.
+
+    Returns:
+        str: A short hex digest identifying this exact call.
+    """
+    signature = json.dumps({"name": name, "args": args}, sort_keys=True, default=str)
+    return hashlib.sha256(signature.encode()).hexdigest()[:16]
+
+
+
+def find_duplicate_call(
+    name: str, args: dict, history: list[ToolCallRecord], similarity_threshold: float
+) -> Optional[ToolCallRecord]:
+    """Find a prior call that exactly or near-exactly repeats this one.
+
+    Only compares against history entries for the same tool name — args are
+    compared as a canonicalized string via similarity ratio, so this is most
+    meaningful for tools with a single string-ish field (e.g. a search query).
+
+    Args:
+        name: The tool name being called.
+        args: The tool call arguments.
+        history: Previously executed calls this turn/worker-run.
+        similarity_threshold: Minimum ``difflib`` ratio (0-1) to count as a near-duplicate.
+
+    Returns:
+        Optional[ToolCallRecord]: The matching prior call, or ``None``.
+    """
+    signature = compute_call_signature(name, args)
+    args_str = json.dumps(args, sort_keys=True, default=str)
+    for entry in history:
+        # called a different tool
+        if entry.name != name:
+            continue
+        # name is same and signature is the same
+        if entry.signature == signature:
+            return entry
+        # calculate similarity ratio for args
+        # difflib only compare longest similarity of two string -> no semantic comparing
+        ratio = difflib.SequenceMatcher(None, args_str, json.dumps(entry.args, sort_keys=True, default=str)).ratio()
+        if ratio > similarity_threshold:
+            return entry
+    return None
+
+def detect_cycle(history: list[ToolCallRecord], max_period: int = 3, min_repeats: int = 2) -> Optional[int]:
+    """Detect a repeating call pattern at the tail of the history (e.g. A,B,A,B is period 2).
+
+    Args:
+        history: Previously executed calls this turn/worker-run, in order.
+        max_period: Largest pattern length to check for.
+        min_repeats: How many full repetitions of a pattern are required to flag a cycle.
+
+    Returns:
+        Optional[int]: The detected period, or ``None`` if no cycle is found.
+    """
+
+    signatures = [entry.signature for entry in history]
+    n = len(signatures)
+    # use sliding window to check last max_period
+    for period in range (1, max_period + 1):
+        window = period * min_repeats
+        if n < window:
+            continue
+        tail = signatures[-window:]
+        pattern = tail[:period]
+        # period (A,B,C) period 3 A,B,C
+        # repeats: determine the window size repeat = 2, A,B,A,B
+        # check if all period == pattern in the window, AB == AB == AB
+        if all(tail[i * period: (i + 1) * period] == pattern for i in range(min_repeats)):
+            return period
+    return None

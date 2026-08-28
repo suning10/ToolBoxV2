@@ -5,6 +5,8 @@ from datetime import datetime
 from typing import Optional
 
 from app.core.config import settings
+from app.core.skills import list_skills_summary
+
 
 _PROMPTS_DIR = os.path.dirname(__file__)
 
@@ -15,6 +17,8 @@ with open(os.path.join(_PROMPTS_DIR, "system.md"), "r") as _f:
 with open(os.path.join(_PROMPTS_DIR, "session_title.md"), "r") as _f:
     SESSION_TITLE_PROMPT = _f.read()
 
+with open(os.path.join(_PROMPTS_DIR, "decomposition.md"), "r") as _f:
+    DECOMPOSITION_PROMPT = _f.read()
 
 def load_system_prompt(username: Optional[str] = None, **kwargs):
     """Load the system prompt from the cached template."""
@@ -23,5 +27,6 @@ def load_system_prompt(username: Optional[str] = None, **kwargs):
         agent_name=settings.PROJECT_NAME + " Agent",
         current_date_and_time=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         user_context=user_context,
+        available_skills=list_skills_summary(),
         **kwargs,
     )

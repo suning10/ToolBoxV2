@@ -154,6 +154,9 @@ class Settings:
         self.MAX_LLM_CALL_RETRIES = int(os.getenv("MAX_LLM_CALL_RETRIES", "3"))
         self.LLM_TOTAL_TIMEOUT = int(os.getenv("LLM_TOTAL_TIMEOUT", "60"))
         self.MAX_TOOL_CALLS_PER_TURN = int(os.getenv("MAX_TOOL_CALLS_PER_TURN", "5"))
+        self.MAX_SUBTASKS = int(os.getenv("MAX_SUBTASKS", "4"))
+        self.MAX_TOOL_CALLS_PER_WORKER = int(os.getenv("MAX_TOOL_CALLS_PER_WORKER", "3"))
+        self.TOOL_CALL_SIMILARITY_THRESHOLD = float(os.getenv("TOOL_CALL_SIMILARITY_THRESHOLD", "0.8"))
 
         # Long term memory Configuration
         self.LONG_TERM_MEMORY_MODEL = os.getenv("LONG_TERM_MEMORY_MODEL", "gpt-5-nano")
