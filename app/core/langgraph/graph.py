@@ -286,7 +286,7 @@ class LangGraphAgent:
 
         # apply the change to state update tool count in state, goto chat
         # GraphState: {messages, tool_call_count, longterm_memeory}
-        return Command(update={"messages": output,
+        return Command(update={"messages": outputs,
                                "tool_call_count": state.tool_call_count + 1,
                                "action_history": updated_history},
                        goto="chat")
@@ -356,6 +356,7 @@ class LangGraphAgent:
         Args:
             state: This branch's scoped state — the subtask as its only
                 message, via the ``Send`` payload from ``_plan``.
+                langgraph auto construct GraphState from {}
             config: The runnable configuration for this invocation.
 
         Returns:
@@ -650,34 +651,35 @@ class LangGraphAgent:
                     "subtask_results": [],
                     "action_history": [],
                 }
-                message_stream = cast(
-                    AsyncGenerator[tuple[BaseMessage, dict], None],
-                    graph.astream(graph_input, config, stream_mode="messages"),
-                )
-                async for token, metadata in message_stream:
-                    # Only the final answer streams to the client — "plan"'s
-                    # classification and "worker"'s per-subtask research happen
-                    # server-side. metadata["langgraph_node"] is set by LangGraph
-                    # to whichever node is currently executing, even when that
-                    # node calls _chat/_tool_call internally (as "worker" does)
-                    # rather than as their own registered graph nodes.
-                    if metadata.get("langgraph_node") not in ("chat", "synthesize"):
-                        continue
-                    if not isinstance(token, (AIMessage, AIMessageChunk)):
-                        continue
 
-                    text = extract_text_content(token.content)
-                    if text:
-                        yield text
-                # After streaming completes, check for interrupt or update memory
-                state = await graph.aget_state(config)
-                if state.next:
-                    interrupt_value = state.tasks[0].interrupts[0].value if state.tasks else "Waiting for input."
-                    logger.info("graph_interrupted_stream", session_id=session_id, interrupt_value=str(interrupt_value))
-                    yield str(interrupt_value)
-                elif state.values and "messages" in state.values:
-                    openai_msgs = cast(list[dict], convert_to_openai_messages(state.values["messages"]))
-                    asyncio.create_task(memory_service.add(user_id, openai_msgs, config.get("metadata")))
+            message_stream = cast(
+                AsyncGenerator[tuple[BaseMessage, dict], None],
+                graph.astream(graph_input, config, stream_mode="messages"),
+            )
+            async for token, metadata in message_stream:
+                # Only the final answer streams to the client — "plan"'s
+                # classification and "worker"'s per-subtask research happen
+                # server-side. metadata["langgraph_node"] is set by LangGraph
+                # to whichever node is currently executing, even when that
+                # node calls _chat/_tool_call internally (as "worker" does)
+                # rather than as their own registered graph nodes.
+                if metadata.get("langgraph_node") not in ("chat", "synthesize"):
+                    continue
+                if not isinstance(token, (AIMessage, AIMessageChunk)):
+                    continue
+
+                text = extract_text_content(token.content)
+                if text:
+                    yield text
+            # After streaming completes, check for interrupt or update memory
+            state = await graph.aget_state(config)
+            if state.next:
+                interrupt_value = state.tasks[0].interrupts[0].value if state.tasks else "Waiting for input."
+                logger.info("graph_interrupted_stream", session_id=session_id, interrupt_value=str(interrupt_value))
+                yield str(interrupt_value)
+            elif state.values and "messages" in state.values:
+                openai_msgs = cast(list[dict], convert_to_openai_messages(state.values["messages"]))
+                asyncio.create_task(memory_service.add(user_id, openai_msgs, config.get("metadata")))
 
         except GraphInterrupt:
             state = await graph.aget_state(config)
