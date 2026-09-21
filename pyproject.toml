@@ -67,6 +67,8 @@ test = ["httpx>=0.28.1", "pytest>=8.3.5"]
 
 [tool.pytest.ini_options]
 markers = ["slow: marks tests as slow (deselect with '-m \"not slow\"')"]
+pythonpath = ["."]
+testpaths = ["test"]
 python_files = ["test_*.py", "*_test.py", "tests.py"]
 
 [tool.black]
