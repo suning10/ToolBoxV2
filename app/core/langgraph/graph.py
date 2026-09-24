@@ -1,3 +1,6 @@
+"""This file contains the LangGraph Agent/workflow and interactions with the LLM."""
+
+
 import asyncio
 from typing import (
     AsyncGenerator,
@@ -6,31 +9,33 @@ from typing import (
 )
 from urllib.parse import quote_plus
 
-import httpx
-import openai
 from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.messages import (
     AIMessage,
     AIMessageChunk,
     BaseMessage,
+    HumanMessage,
+    SystemMessage,
     ToolMessage,
-    convert_to_openai_messages, SystemMessage, HumanMessage,
+    convert_to_openai_messages,
 )
 from langchain_core.tools import BaseTool
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from langgraph.errors import GraphInterrupt
 from langgraph.graph import (
     END,
-    StateGraph, add_messages,
+    StateGraph,
 )
 from langchain_core.runnables.config import RunnableConfig
+from langgraph.graph.message import add_messages
 from langgraph.graph.state import (
     Command,
     CompiledStateGraph,
 )
 from langgraph.types import (
     RetryPolicy,
-    StateSnapshot, Send,
+    Send,
+    StateSnapshot,
 )
 from psycopg import (
     AsyncConnection,
@@ -50,21 +55,28 @@ from app.core.langgraph.tools import tools
 from app.core.logging import logger
 from app.core.metrics import llm_inference_duration_seconds
 from app.core.observability import langfuse_callback_handler
-from app.core.prompts import load_system_prompt, DECOMPOSITION_PROMPT
+from app.core.prompts import (
+    DECOMPOSITION_PROMPT,
+    load_system_prompt,
+)
 from app.schemas import (
     GraphState,
     Message,
+    QueryPlan,
+    ToolCallRecord,
 )
-from app.schemas.graph import ToolCallRecord, QueryPlan
 from app.services.llm import llm_service
 from app.services.memory import memory_service
+from app.services.rag import rag_service
 from app.utils import (
+    compute_call_signature,
+    detect_cycle,
     dump_messages,
     extract_text_content,
+    find_duplicate_call,
     prepare_messages,
     process_llm_response,
 )
-from app.utils.graph import find_duplicate_call, compute_call_signature, detect_cycle
 
 PostgresConnPool = AsyncConnectionPool[AsyncConnection[DictRow]]
 
@@ -156,7 +168,10 @@ class LangGraphAgent:
         # step 2: pull information from mem0 for user specific information
         username = config.get("metadata",{}).get("username")
         thread_id = config.get("configurable", {}).get("thread_id")
-        SYSTEM_PROMPT = load_system_prompt(username = username, long_term_memory = state.long_term_memory)
+        # step 2.1 inject into system prompt long term memory + knowledgebase
+        SYSTEM_PROMPT = load_system_prompt(
+            username=username, long_term_memory=state.long_term_memory, knowledge_base=state.knowledge_base
+        )
         # step 3: prepare message
         messages = prepare_messages(state.messages, SYSTEM_PROMPT)
         # step 4: check reached turns allowed
@@ -202,7 +217,7 @@ class LangGraphAgent:
                 environment=settings.ENVIRONMENT.value,
                 tool_call_count=state.tool_call_count,
             )
-
+            # step 7: decide if tool call is needed
             if not tool_limit_flag and isinstance(response_message, AIMessage) and response_message.tool_calls:
                 goto = "tool_call"
             else:
@@ -218,10 +233,8 @@ class LangGraphAgent:
             )
             raise Exception(f"failed to get llm response after trying all models: {str(e)}")
 
-    async def _tool_call(self, state: GraphState) -> Command:
+    async def _tool_call(self, state: GraphState, config: RunnableConfig) -> Command:
         """Process tool calls from the last message.
-
-        Process tool calls from the last message.
 
         Detects exact-duplicate and near-duplicate (string-similarity on args)
         repeat calls against this turn's ``action_history``, reusing the
@@ -232,15 +245,20 @@ class LangGraphAgent:
 
         Args:
             state: The current agent state containing messages and tool calls.
+            config: The runnable configuration for this invocation. Forwarded
+                to each tool's ``ainvoke`` so tools can request injected
+                ``RunnableConfig`` access (e.g. the authenticated ``user_id``
+                for access-controlled tools like ``rag_search``) without the
+                LLM ever supplying or overriding it.
 
         Returns:
             Command: Command object with updated messages, action_history,
                 and tool_call_count, routing back to chat.
 
         """
-        tool_calls = state.messages[-1].tool_calls # # [{'name': 'get_weather', 'args': {'location': 'NYC'}, 'id': 'call_abc123'}]
+        tool_calls = state.messages[-1].tool_calls # [{'name': 'get_weather', 'args': {'location': 'NYC'}, 'id': 'call_abc123'}]
         history = state.action_history
-        async def _execute_tool(tool_call: dict) -> ToolMessage:
+        async def _execute_tool(tool_call: dict) -> tuple[ToolMessage, ToolCallRecord]:
             name, args = tool_call["name"], tool_call["args"]
             # find duplicate
             duplicate = find_duplicate_call(name, args, history, settings.TOOL_CALL_SIMILARITY_THRESHOLD)
@@ -254,15 +272,15 @@ class LangGraphAgent:
                     f"instead of calling the tool again. Try a different approach.]\n\n{result}"
                 )
             else:
-                result = await self.tools_by_name[name].ainvoke(args)
+                result = await self.tools_by_name[name].ainvoke(args, config)
                 content = result
-
+            # record for cycle dection
             record = ToolCallRecord(name=name, args=args, signature=compute_call_signature(name, args), result=result)
             return ToolMessage(content=content, name=name, tool_call_id=tool_call["id"]), record
 
         # execute all tools concurrently
         if len(tool_calls) == 1:
-            output = await _execute_tool(tool_calls[0])
+            output = [await _execute_tool(tool_calls[0])]
 
         else:
             # gather(tool1, tool2, tool3)
@@ -340,7 +358,7 @@ class LangGraphAgent:
             update={"subtasks": subtasks},
             goto=[
                 Send("worker",
-                     {"messages": [{"role": "user", "content": subtask}], "long_term_memory": state.long_term_memory})
+                     {"messages": [{"role": "user", "content": subtask}], "long_term_memory": state.long_term_memory, "knowledge_base": state.knowledge_base,})
                 for subtask in subtasks
             ])
 
@@ -369,15 +387,15 @@ class LangGraphAgent:
             chat_command = await self._chat(
                 local_state,
                 config,
-                allowed_tools= self._worker_tools,
-                tool_call_limit=settings.MAX_SUBTASKS,
+                allowed_tools=self._worker_tools,
+                tool_call_limit=settings.MAX_TOOL_CALLS_PER_WORKER,
             )
             chat_update = cast(dict, chat_command.update)
             local_state.messages = cast(list, add_messages(local_state.messages, chat_update["messages"]))
             if chat_command.goto == END:
                 break
 
-            tool_command = await self._tool_call(local_state)
+            tool_command = await self._tool_call(local_state,config)
             tool_update = cast(dict, tool_command.update)
             local_state.messages = cast(list, add_messages(local_state.messages, tool_update["messages"]))
             local_state.tool_call_count = tool_update["tool_call_count"]

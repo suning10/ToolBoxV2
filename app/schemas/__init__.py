@@ -8,7 +8,22 @@ from app.schemas.chat import (
     Message,
     StreamResponse,
 )
-from app.schemas.graph import GraphState
+from app.schemas.graph import (
+    GraphState,
+    QueryPlan,
+    ToolCallRecord,
+)
+from app.schemas.rag import (
+    DocumentCreate,
+    DocumentResponse,
+    GroupCreate,
+    GroupMemberAdd,
+    GroupMemberResponse,
+    GroupResponse,
+    SearchRequest,
+    SearchResponse,
+    SearchResult,
+)
 
 __all__ = [
     "Token",
@@ -18,4 +33,15 @@ __all__ = [
     "Message",
     "StreamResponse",
     "GraphState",
+    "QueryPlan",
+    "ToolCallRecord",
+    "DocumentCreate",
+    "DocumentResponse",
+    "GroupCreate",
+    "GroupMemberAdd",
+    "GroupMemberResponse",
+    "GroupResponse",
+    "SearchRequest",
+    "SearchResponse",
+    "SearchResult",
 ]

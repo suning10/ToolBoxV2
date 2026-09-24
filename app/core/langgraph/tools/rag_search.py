@@ -37,6 +37,6 @@ async def rag_search(query: str, config: RunnableConfig) -> str:
         logger.warning("rag_search_unauthenticated")
         return "No knowledge base access: this session is not authenticated."
 
-    results = await rag_service.search(int(user_id), query)
+    results = await rag_service.search_context(int(user_id), query)
     logger.info("rag_search_completed", user_id=user_id, result_count=len(results))
     return await rag_service.format_results(results)

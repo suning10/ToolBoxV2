@@ -67,7 +67,7 @@ async def run_skill_script(skill_name: str, script_name: str, script_args: list[
         try:
             stdout, stderr = await asyncio.wait_for(
                 process.communicate(), timeout=settings.SKILL_SCRIPT_TIMEOUT_SECONDS
-            )
+            ) # start the process and use wait for to cancel in case timeout
         except asyncio.TimeoutError:
             process.kill()
             await process.wait()
