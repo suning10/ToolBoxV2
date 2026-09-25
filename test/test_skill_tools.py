@@ -1,6 +1,7 @@
 """Tests for the ``load_skill`` and ``run_skill_script`` LangGraph tools."""
 
 import asyncio
+import sys
 
 import pytest
 
@@ -8,6 +9,11 @@ from app.core.config import settings
 from app.core.langgraph.tools.load_skill import load_skill
 from app.core.langgraph.tools.run_skill_script import run_skill_script
 from app.core.skills import SkillDefinition
+
+# ``app.core.langgraph.tools`` re-exports the tool objects under the same names as their modules,
+# so a dotted-string patch target would resolve to the tool, not the module. Go through sys.modules.
+LOAD_SKILL_MODULE = sys.modules["app.core.langgraph.tools.load_skill"]
+RUN_SKILL_SCRIPT_MODULE = sys.modules["app.core.langgraph.tools.run_skill_script"]
 
 SCRIPTS = {
     "echo.py": "import sys\nprint(' '.join(sys.argv[1:]))\n",
@@ -37,8 +43,8 @@ def registry(tmp_path, monkeypatch):
     plain = SkillDefinition(name="plain", description="No scripts here.", body="Just words.")
     skills = {"demo": demo, "plain": plain}
 
-    monkeypatch.setattr("app.core.langgraph.tools.load_skill.SKILLS", skills)
-    monkeypatch.setattr("app.core.langgraph.tools.run_skill_script.SKILLS", skills)
+    monkeypatch.setattr(LOAD_SKILL_MODULE, "SKILLS", skills)
+    monkeypatch.setattr(RUN_SKILL_SCRIPT_MODULE, "SKILLS", skills)
     # raising=False: these limits are asserted to exist in ``test_settings_define_script_limits`` below, so
     # the behaviour tests stay independent of whether the settings class has been updated yet.
     monkeypatch.setattr(settings, "SKILL_SCRIPT_TIMEOUT_SECONDS", 10, raising=False)
@@ -191,7 +197,7 @@ class TestRunSkillScriptExecution:
         async def explode(*args, **kwargs):
             raise OSError("cannot spawn")
 
-        monkeypatch.setattr("app.core.langgraph.tools.run_skill_script.asyncio.create_subprocess_exec", explode)
+        monkeypatch.setattr(RUN_SKILL_SCRIPT_MODULE.asyncio, "create_subprocess_exec", explode)
 
         result = run_script("demo", "echo.py", ["hi"])
 

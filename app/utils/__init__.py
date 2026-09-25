@@ -5,6 +5,8 @@ from .graph import (
     dump_messages,
     extract_text_content,
     find_duplicate_call,
+    is_orphaned_run_for,
+    pending_interrupt_value,
     prepare_messages,
     process_llm_response,
 )
@@ -17,4 +19,6 @@ __all__ = [
     "compute_call_signature",
     "find_duplicate_call",
     "detect_cycle",
+    "pending_interrupt_value",
+    "is_orphaned_run_for",
 ]

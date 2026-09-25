@@ -60,7 +60,7 @@ class RAGService:
         self.engine  = database_service.engine
         self._embedder: Optional[OpenAIEmbeddings] = None
         self._splitter = RecursiveCharacterTextSplitter(
-            cache_key=settings.RAG_CHUNK_SIZE,
+            chunk_size=settings.RAG_CHUNK_SIZE,
             chunk_overlap=settings.RAG_CHUNK_OVERLAP,
         )
 

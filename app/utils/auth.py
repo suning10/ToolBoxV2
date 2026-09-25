@@ -66,7 +66,7 @@ def verify_token(token: str) -> Optional[str]:
 
     # Basic format validation before attempting decode
     # JWT tokens consist of 3 base64url-encoded segments separated by dots
-    if not re.match(r"^[A-Za-z0-9-_]+\.[A-Za-z0-9-_]+\.[A-Za-z0-9-_]+$", token):
+    if not re.fullmatch(r"[A-Za-z0-9-_]+\.[A-Za-z0-9-_]+\.[A-Za-z0-9-_]+", token):
         logger.warning("token_suspicious_format")
         raise ValueError("Token format is invalid - expected JWT format")
 

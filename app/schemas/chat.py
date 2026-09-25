@@ -89,6 +89,16 @@ class StreamResponse(BaseResponse):
     done: bool = Field(default=False, description="Whether the stream is complete")
 
 
+class ActiveRunResponse(BaseResponse):
+    """Response model for the "is a response still being generated?" endpoint.
+
+    Attributes:
+        run_id: The in-flight run; re-attach with ``GET /chat/stream/{run_id}`` and ``Last-Event-ID``.
+    """
+
+    run_id: str = Field(..., description="The run currently generating a response for this session")
+
+
 class SessionTitle(BaseModel):
     """Structured output schema for session title generation."""
 

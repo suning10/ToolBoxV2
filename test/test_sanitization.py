@@ -84,13 +84,8 @@ class TestSanitizeEmail:
             "user@exa mple.com",
             "user@@example.com",
             "<script>@example.com",
-            pytest.param(
-                "user@example.com\n",
-                marks=pytest.mark.xfail(
-                    strict=True,
-                    reason="known bug: '$' in the email regex also matches before a trailing newline",
-                ),
-            ),
+            "user@example.com\n",  # regression: "$" also matched before a trailing newline
+            "user@example.com\r\n",
         ],
     )
     def test_invalid_addresses_are_rejected(self, email):

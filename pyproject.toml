@@ -40,6 +40,7 @@ dependencies = [
     "alembic>=1.18.4",
     "redis>=7.4.0",
     "valkey[libvalkey]>=6.1.0",
+    "pgvector>=0.3.6",
     "pytest"
 ]
 [project.optional-dependencies]
@@ -63,7 +64,7 @@ dev = [
     "pyright>=1.1.390",
     "ruff>=0.11.4",
 ]
-test = ["httpx>=0.28.1", "pytest>=8.3.5"]
+test = ["fakeredis>=2.26.0", "httpx>=0.28.1", "pytest>=8.3.5"]
 
 
 [tool.pytest.ini_options]

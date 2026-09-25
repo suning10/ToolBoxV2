@@ -11,9 +11,7 @@ On the first message of a new session this module:
 
 import asyncio
 
-from envs.fastapi.Lib.unittest import result
 from langchain_core.messages import HumanMessage, SystemMessage
-from openai.types.shared import reasoning
 from sqlmodel import (
     Session as DBSession,
     col,
@@ -78,9 +76,9 @@ async def _persist_session_name(session_id: str, user_message: str) -> None:
                 temperature=0.3,
             )
         # 2. update database with generated session name
-            await database_service.update(generated_session_name.title)
+            await database_service.update_session_name(session_id, generated_session_name.title)
             session_names_generated_total.labels(status="success").inc()
-            logger.info("session_name_generated", session_id=session_id, name=result.title)
+            logger.info("session_name_generated", session_id=session_id, name=generated_session_name.title)
         except Exception:
             session_names_generated_total.labels(status="error").inc()
             logger.exception("session_name_generation_failed", session_id=session_id)

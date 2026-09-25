@@ -215,3 +215,51 @@ def detect_cycle(history: list[ToolCallRecord], max_period: int = 3, min_repeats
         if all(tail[i * period: (i + 1) * period] == pattern for i in range(min_repeats)):
             return period
     return None
+
+
+def pending_interrupt_value(snapshot) -> Optional[object]:
+    """Return the value of the first unanswered ``interrupt()`` on a thread, if any.
+
+    ``snapshot.next`` is non-empty both when the graph is paused on an
+    ``interrupt()`` (e.g. ``ask_human``) *and* when a run died mid-flight
+    (client disconnect, crash), so it cannot be used to decide whether a
+    ``Command(resume=...)`` has anything to consume. Only an interrupt attached
+    to a pending task can.
+
+    Args:
+        snapshot: A LangGraph ``StateSnapshot`` from ``graph.aget_state``.
+
+    Returns:
+        The interrupt's payload, or ``None`` when no interrupt is pending.
+    """
+    for task in snapshot.tasks:
+        if task.interrupts:
+            return task.interrupts[0].value
+    return None
+
+
+def is_orphaned_run_for(snapshot, messages: list[Message]) -> bool:
+    """Whether the thread holds an unfinished run for the turn ``messages`` is retrying.
+
+    True when the checkpoint still has nodes to run, no interrupt is waiting on
+    the user, and the last user message being sent is the one that started the
+    unfinished run — i.e. the client is reconnecting after a dropped stream and
+    the run should continue from its checkpoint rather than start over.
+
+    Args:
+        snapshot: A LangGraph ``StateSnapshot`` from ``graph.aget_state``.
+        messages: The messages in the incoming request.
+
+    Returns:
+        bool: True if the run should be continued with ``None`` as graph input.
+    """
+    if not snapshot.next or pending_interrupt_value(snapshot) is not None:
+        return False
+    if not messages or messages[-1].role != "user":
+        return False
+
+    stored = (snapshot.values or {}).get("messages", [])
+    last_human = next((m for m in reversed(stored) if m.type == "human"), None)
+    if last_human is None:
+        return False
+    return extract_text_content(last_human.content) == messages[-1].content

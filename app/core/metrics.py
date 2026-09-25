@@ -3,8 +3,19 @@
 This module sets up and configures Prometheus metrics for monitoring the application.
 """
 
+import time
+
 from prometheus_client import Counter, Histogram, Gauge
+from starlette.requests import Request
+from starlette.responses import Response
 from starlette_prometheus import metrics, PrometheusMiddleware
+from starlette_prometheus.middleware import (
+    EXCEPTIONS,
+    REQUESTS,
+    REQUESTS_IN_PROGRESS,
+    REQUESTS_PROCESSING_TIME,
+    RESPONSES,
+)
 
 # Request metrics
 http_requests_total = Counter("http_requests_total", "Total number of HTTP requests", ["method", "endpoint", "status"])
@@ -41,6 +52,72 @@ session_names_generated_total = Counter(
 )
 
 
+UNMATCHED_PATH = "unmatched"
+
+
+def resolve_path_template(request: Request) -> str:
+    """Return the full, low-cardinality path template a request was routed to.
+
+    ``starlette-prometheus`` finds the template by matching ``app.routes`` up front, which breaks on
+    FastAPI versions that keep ``include_router`` results as nested ``_IncludedRouter`` objects
+    (they have no ``.path``). Once a request has been handled Starlette stores the matched route in
+    ``scope["route"]``, but its ``path`` omits the ``include_router`` prefixes, so the prefix is
+    recovered from the real URL: substitute the matched path params into ``path_format`` to get the
+    concrete suffix, strip it from the request path, and prepend what is left to the template.
+
+    Args:
+        request: A request that has already been handled (so ``scope["route"]`` is populated).
+
+    Returns:
+        str: e.g. ``/api/v1/auth/session/{session_id}/name``, or ``"unmatched"`` for 404s so that
+            scanners hitting random URLs cannot create unbounded metric labels.
+    """
+    route = request.scope.get("route")
+    template = getattr(route, "path", None)
+    if template is None:
+        return UNMATCHED_PATH
+    try:
+        concrete_suffix = route.path_format.format(**request.scope.get("path_params", {}))
+        path = request.url.path
+        if path.endswith(concrete_suffix):
+            return path[: len(path) - len(concrete_suffix)] + template
+    except (AttributeError, KeyError, IndexError, ValueError):
+        pass
+    return template
+
+
+class RouteTemplatePrometheusMiddleware(PrometheusMiddleware):
+    """``PrometheusMiddleware`` that labels by the resolved route template *after* routing.
+
+    The in-progress gauge is incremented before routing, when the template isn't known yet, so it is
+    labelled by method only (``path_template="*"``). Every other metric uses the full template.
+    """
+
+    async def dispatch(self, request: Request, call_next) -> Response:
+        method = request.method
+        path_template = UNMATCHED_PATH
+        REQUESTS_IN_PROGRESS.labels(method=method, path_template="*").inc()
+        before_time = time.perf_counter()
+        status_code = 500
+        try:
+            response = await call_next(request)
+        except BaseException as e:
+            path_template = resolve_path_template(request)
+            EXCEPTIONS.labels(method=method, path_template=path_template, exception_type=type(e).__name__).inc()
+            raise e from None
+        else:
+            path_template = resolve_path_template(request)
+            status_code = response.status_code
+            REQUESTS_PROCESSING_TIME.labels(method=method, path_template=path_template).observe(
+                time.perf_counter() - before_time
+            )
+            return response
+        finally:
+            REQUESTS.labels(method=method, path_template=path_template).inc()
+            RESPONSES.labels(method=method, path_template=path_template, status_code=status_code).inc()
+            REQUESTS_IN_PROGRESS.labels(method=method, path_template="*").dec()
+
+
 def setup_metrics(app):
     """Set up Prometheus metrics middleware and endpoints.
 
@@ -48,7 +125,7 @@ def setup_metrics(app):
         app: FastAPI application instance
     """
     # Add Prometheus middleware
-    app.add_middleware(PrometheusMiddleware)
+    app.add_middleware(RouteTemplatePrometheusMiddleware)
 
     # Add metrics endpoint
     app.add_route("/metrics", metrics)

@@ -132,6 +132,7 @@ class TestVerifyToken:
             "has space.in.it",
             "a..c",
             "a.b.",
+            "a.b.c\n",
             "a.b.c;drop table",
             "ünïcode.b.c",
         ],

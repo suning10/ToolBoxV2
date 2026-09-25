@@ -90,7 +90,7 @@ async def get_current_user(
         bind_context(user_id=user_id_int)
 
         return user
-    except ValueError as e:
+    except ValueError as ve:
         logger.exception("token_validation_failed", error=str(ve))
         raise HTTPException(
             status_code=422,

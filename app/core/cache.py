@@ -76,7 +76,7 @@ class InMemoryCacheService:
             value: The value to cache.
             ttl: Time-to-live in seconds. Uses default if not specified.
         """
-        expires_at = time.monotonic() + (ttl or self._default_ttl)
+        expires_at = time.monotonic() + (ttl or self.default_ttl)
         self._cache[key] = (expires_at, value)
 
     async def delete(self, key: str) -> None:

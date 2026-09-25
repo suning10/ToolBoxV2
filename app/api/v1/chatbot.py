@@ -1,8 +1,10 @@
 import json
+from typing import Optional
 
 from fastapi import (
     APIRouter,
     Depends,
+    Header,
     HTTPException,
     Request,
 )
@@ -16,14 +18,55 @@ from app.core.logging import logger
 from app.core.metrics import llm_stream_duration_seconds
 from app.models.session import Session
 from app.schemas.chat import (
+    ActiveRunResponse,
     ChatRequest,
     ChatResponse,
-    StreamResponse,
+)
+from app.services.run_stream import (
+    START_ID,
+    StreamEvent,
+    is_valid_event_id,
+    is_valid_run_id,
+    run_stream_service,
 )
 from app.services.session_naming import maybe_name_session
 
 router = APIRouter()
 agent = LangGraphAgent()
+
+RUN_ID_HEADER = "X-Run-Id"
+# no-cache + no proxy buffering: a buffering proxy would hold tokens back and make resuming pointless
+SSE_HEADERS = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
+
+
+def _sse(event: StreamEvent) -> str:
+    """Format one follower event as SSE. Buffered events carry an ``id:`` so clients can resume from them."""
+    if event.payload is None:
+        return ": keep-alive\n\n"
+    data = f"data: {json.dumps(event.payload)}\n\n"
+    return f"id: {event.id}\n{data}" if event.id else data
+
+
+def _follow_response(run_id: str, after_id: str) -> StreamingResponse:
+    """Stream a run's events after ``after_id``. Disconnecting only stops *following*; the run keeps going."""
+
+    async def body():
+        async for event in run_stream_service.follow(run_id, after_id):
+            yield _sse(event)
+
+    return StreamingResponse(
+        body(), media_type="text/event-stream", headers={**SSE_HEADERS, RUN_ID_HEADER: run_id}
+    )
+
+
+def _resume_point(last_event_id: Optional[str]) -> str:
+    """Validate the ``Last-Event-ID`` header; absent means "from the beginning"."""
+    if not last_event_id:
+        return START_ID
+    if not is_valid_event_id(last_event_id):
+        raise HTTPException(status_code=400, detail="Invalid Last-Event-ID")
+    return last_event_id
+
 
 @router.post("/chat", response_model=ChatResponse)
 @limiter.limit(settings.RATE_LIMIT_ENDPOINTS["chat"][0])
@@ -43,9 +86,12 @@ async def chat(
         ChatResponse: The processed chat response.
 
     Raises:
-        HTTPException: If there's an error processing the request.
+        HTTPException: 409 if a streamed response is still being generated for this session, or 500 if
+            there's an error processing the request.
     """
     try:
+        if await run_stream_service.get_active_run(session.id) is not None:
+            raise HTTPException(status_code=409, detail="A streaming response is still in progress for this session")
         logger.info(
             "chat_request_received",
             session_id=session.id,
@@ -63,6 +109,8 @@ async def chat(
         )
         logger.info("chat_request_processed", session_id=session.id)
         return ChatResponse(messages=result)
+    except HTTPException:
+        raise
     except Exception as e:
         logger.exception("chat_request_failed", session_id=session.id, error=str(e))
         raise HTTPException(status_code=500, detail=str(e))
@@ -73,58 +121,62 @@ async def chat_stream(
     request: Request,
     chat_request: ChatRequest,
     session: Session = Depends(get_current_session),
+    last_event_id: Optional[str] = Header(default=None),
 ):
-    """Process a chat request using LangGraph with streaming response.
+    """Start a chat run and stream its events as SSE; the run survives the client disconnecting.
+
+    The graph runs in the background and buffers every event. Each event carries an ``id:``; if the connection
+    drops, re-attach with ``GET /chat/stream/{run_id}`` (``run_id`` is in the ``X-Run-Id`` response header)
+    and ``Last-Event-ID`` set to the last id received. Re-sending the *same* message while its run is still in
+    flight is also safe: it attaches to the existing run instead of starting a second one.
 
     Args:
         request: The FastAPI request object for rate limiting.
         chat_request: The chat request containing messages.
         session: The current session from the auth token.
+        last_event_id: Only used when attaching to an in-flight run; a new run always streams from its start.
 
     Returns:
-        StreamingResponse: A streaming response of the chat completion.
+        StreamingResponse: ``text/event-stream`` of ``StreamResponse`` events, ending with ``done: true``.
 
     Raises:
-        HTTPException: If there's an error processing the request.
+        HTTPException: 400 for a malformed ``Last-Event-ID``; 409 (with the in-flight ``run_id``) if the session
+            is busy with a different message; 500 on an unexpected error.
     """
     try:
+        after_id = _resume_point(last_event_id)
         logger.info(
             "stream_chat_request_received",
             session_id=session.id,
             message_count=len(chat_request.messages),
         )
 
-        if settings.SESSION_NAMING_ENABLED:
-            maybe_name_session(session.id, session.name, chat_request.messages)
+        # Capture plain values now: the background run outlives this request (and the auth DB session).
+        session_id, user_id, username = session.id, str(session.user_id), session.username
+        messages = chat_request.messages
 
-        async def event_generator():
-            f"""Generate streaming events. convert LLM Response to SSE Event data:StreamResponse
+        async def agent_stream():
+            with llm_stream_duration_seconds.labels(model=agent.llm_service.get_llm().get_name()).time():
+                async for chunk in agent.get_stream_response(messages, session_id, user_id=user_id, username=username):
+                    yield chunk
 
-            Yields:
-                str: Server-sent events in JSON format.
+        handle = await run_stream_service.start(session_id, messages[-1].content, agent_stream)
+        if handle.outcome == "conflict":
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "message": "A response is already being generated for this session",
+                    "run_id": handle.run_id,
+                },
+            )
+        if handle.outcome == "started":
+            after_id = START_ID  # a header left over from an earlier run must not skip this one's events
+            if settings.SESSION_NAMING_ENABLED:
+                maybe_name_session(session_id, session.name, messages)
 
-            Raises:
-                Exception: If there's an error during streaming.
-            """
-            try:
-                with llm_stream_duration_seconds.labels(model=agent.llm_service.get_llm().get_name()).time():
-                    async for chunk in agent.get_stream_response(
-                        chat_request.messages, session.id, user_id=str(session.user_id), username=session.username
-                    ):
-                        response = StreamResponse(content=chunk, done=False) # StreamResponse here is a schema defined in pydantic
-                        yield f"data: {json.dumps(response.model_dump(mode='json'))}\n\n"
-                final_response = StreamResponse(content="", done=True)
-                yield f"data: {json.dumps(final_response.model_dump(mode='json'))}\n\n"
-            except Exception as e:
-                logger.exception(
-                    "stream_chat_request_failed",
-                    session_id=session.id,
-                    error=str(e),
-                )
-                error_response = StreamResponse(content=str(e), done=True)
-                yield f"data: {json.dumps(error_response.model_dump(mode='json'))}\n\n"
-        # StreamingResponse will automatically call event_generator's __next__
-        return StreamingResponse(event_generator(), media_type="text/event-stream")
+        return _follow_response(handle.run_id, after_id)
+    except HTTPException:
+        raise
     except Exception as e:
         logger.exception(
             "stream_chat_request_failed",
@@ -132,6 +184,62 @@ async def chat_stream(
             error=str(e),
         )
         raise HTTPException(status_code=500, detail=str(e))
+
+# Declared before "/chat/stream/{run_id}" so "active" is not captured as a run id.
+@router.get("/chat/stream/active", response_model=ActiveRunResponse)
+@limiter.limit(settings.RATE_LIMIT_ENDPOINTS["chat_resume"][0])
+async def get_active_stream(
+    request: Request,
+    session: Session = Depends(get_current_session),
+):
+    """Report the run still generating a response for this session (e.g. after a page reload).
+
+    Args:
+        request: The FastAPI request object for rate limiting.
+        session: The current session from the auth token.
+
+    Returns:
+        ActiveRunResponse: The in-flight run to re-attach to.
+
+    Raises:
+        HTTPException: 404 if nothing is being generated.
+    """
+    run_id = await run_stream_service.get_active_run(session.id)
+    if run_id is None:
+        raise HTTPException(status_code=404, detail="No response is in progress for this session")
+    return ActiveRunResponse(run_id=run_id)
+
+@router.get("/chat/stream/{run_id}")
+@limiter.limit(settings.RATE_LIMIT_ENDPOINTS["chat_resume"][0])
+async def resume_chat_stream(
+    request: Request,
+    run_id: str,
+    session: Session = Depends(get_current_session),
+    last_event_id: Optional[str] = Header(default=None),
+):
+    """Re-attach to a run and continue from the last event the client received.
+
+    Works while the run is generating and for a while after it finishes (the buffered tail is replayed), so a
+    client that missed the end of the stream can still collect it.
+
+    Args:
+        request: The FastAPI request object for rate limiting.
+        run_id: The run to follow, from the ``X-Run-Id`` header of the original response.
+        session: The current session from the auth token.
+        last_event_id: Last event id already received; omit to replay from the start.
+
+    Returns:
+        StreamingResponse: ``text/event-stream`` of the events after ``last_event_id``.
+
+    Raises:
+        HTTPException: 400 for a malformed ``Last-Event-ID``; 404 if the run is unknown, expired, or belongs to
+            another session.
+    """
+    after_id = _resume_point(last_event_id)
+    if not is_valid_run_id(run_id) or await run_stream_service.get_run(run_id, session.id) is None:
+        raise HTTPException(status_code=404, detail="Run not found or expired")
+    logger.info("stream_resume_requested", session_id=session.id, run_id=run_id, after_id=after_id)
+    return _follow_response(run_id, after_id)
 
 @router.get("/messages", response_model=ChatResponse)
 @limiter.limit(settings.RATE_LIMIT_ENDPOINTS["messages"][0])

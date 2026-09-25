@@ -34,8 +34,8 @@ class DatabaseService:
         """Initialize the database service with connection pool."""
         try:
             # Configure environment-specific database connection pool settings
-            pool_size = settings.POOL_SIZE
-            max_overflow = settings.POOL_MAX_OVERFLOW
+            pool_size = settings.POSTGRES_POOL_SIZE
+            max_overflow = settings.POSTGRES_MAX_OVERFLOW
 
             # Create engine with appropriate pool configuration
             connection_url = (

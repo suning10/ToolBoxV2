@@ -51,7 +51,7 @@ class SkillDefinition(BaseModel):
     name: str
     description: str
     body: str
-    script: dict[str, Path] = {}
+    scripts: dict[str, Path] = {}
 
 
 def _parse_skill_file(path: Path) -> tuple[str,str,str]:
@@ -61,7 +61,7 @@ def _parse_skill_file(path: Path) -> tuple[str,str,str]:
         path: Path to the skill markdown file.
 
     Returns:
-        SkillDefinition: The parsed skill.
+        tuple[str, str, str]: The skill's ``(name, description, body)``.
 
     Raises:
         ValueError: If the file is missing frontmatter or required fields.
@@ -80,7 +80,7 @@ def _parse_skill_file(path: Path) -> tuple[str,str,str]:
         fields[key.strip()] = value.strip()
 
     if "name" not in fields or "description" not in fields:
-        logger.error("fail to load skill", str(path))
+        logger.error("skill_load_failed", path=str(path))
         raise ValueError(f"skill file missing 'name' or 'description' in frontmatter: {path.name}")
 
     return fields["name"], fields["description"], body.strip()
@@ -133,7 +133,6 @@ def _load_skills() -> dict[str, SkillDefinition]:
 # Read and parse once at module load — no file I/O per request.
 SKILLS: dict[str, SkillDefinition] = _load_skills()
 
-# todo: add to pytest
 def list_skills_summary() -> str:
     """Return a formatted skill listing for injection into the system prompt.
 

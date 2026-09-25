@@ -47,7 +47,7 @@ def sanitize_email(email: str) -> str:
     email = sanitize_string(email)
 
     # Ensure email format (simple check)
-    if not re.match(r"^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$", email):
+    if not re.fullmatch(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}", email):
         raise ValueError("Invalid email format")
 
     return email.lower()

@@ -132,11 +132,11 @@ class LLMService:
         try:
             return await asyncio.wait_for(
                 self._call_with_fallback(messages, model_name, response_format, **model_kwargs),
-                timeout=settings.LLM_TIMEOUT,
+                timeout=settings.LLM_TOTAL_TIMEOUT,
         )
         except asyncio.TimeoutError:
-            logger.exception("LLM Timeout", timeout =settings.LLM_TIMEOUT)
-            raise RuntimeError(f"LLM Timeout: {settings.LLM_TIMEOUT}")
+            logger.exception("LLM Timeout", timeout =settings.LLM_TOTAL_TIMEOUT)
+            raise RuntimeError(f"LLM Timeout: {settings.LLM_TOTAL_TIMEOUT}")
 
     def get_llm(self):
         return self._llm
@@ -145,7 +145,7 @@ class LLMService:
 
         if self._llm:
             self._bound_tools = tools
-            self._llm.bond_tools(tools)
+            self._llm = self._llm.bind_tools(tools)
             logger.debug("tools_bound_to_llm", tool_count=len(tools))
         return self
 
@@ -216,7 +216,7 @@ class LLMService:
 
 
     @retry(
-        stop=stop_after_attempt(settings.LLM_RETRY_LIMIT),
+        stop=stop_after_attempt(settings.MAX_LLM_CALL_RETRIES),
         wait=wait_exponential(multiplier=1, min=2, max=10),
         retry=retry_if_exception_type((RateLimitError, APITimeoutError, APIError)),
         before_sleep=before_sleep_log(logger, logging.WARNING),

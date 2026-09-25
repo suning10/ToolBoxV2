@@ -9,6 +9,8 @@ from typing import (
 )
 from urllib.parse import quote_plus
 
+import httpx
+import openai
 from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.messages import (
     AIMessage,
@@ -74,6 +76,8 @@ from app.utils import (
     dump_messages,
     extract_text_content,
     find_duplicate_call,
+    is_orphaned_run_for,
+    pending_interrupt_value,
     prepare_messages,
     process_llm_response,
 )
@@ -161,7 +165,7 @@ class LangGraphAgent:
             Command: Command object with updated state and next node to execute.
         """
         # step 1: get model
-        current_llm = self.llm_service.get_current_llm()
+        current_llm = self.llm_service.get_llm()
         model_name = (current_llm.model_name
                       if current_llm and hasattr(current_llm, "model_name")
                       else settings.DEFAULT_LLM_MODEL)
@@ -175,7 +179,7 @@ class LangGraphAgent:
         # step 3: prepare message
         messages = prepare_messages(state.messages, SYSTEM_PROMPT)
         # step 4: check reached turns allowed
-        tool_limit_flag = state.tool_call_count >= settings.MAX_TOOL_LIMIT
+        tool_limit_flag = state.tool_call_count >= tool_call_limit
         # step 5: fallback - ask LLM to response based on what currently have
         if tool_limit_flag:
             messages = messages + [
@@ -191,7 +195,7 @@ class LangGraphAgent:
                 "tool_call_limit_reached",
                 session_id=thread_id,
                 tool_call_count=state.tool_call_count,
-                max_tool_calls=settings.MAX_TOOL_CALLS_PER_TURN,
+                max_tool_calls=tool_call_limit,
             )
         # step 6: call LLM service
         try:
@@ -559,7 +563,7 @@ class LangGraphAgent:
         """
 
         # step 1: get graph + RunnableConfig
-        graph = await self._graph
+        graph = await self._get_graph()
         callbacks: list[BaseCallbackHandler] = [langfuse_callback_handler] if settings.LANGFUSE_TRACING_ENABLED else []
         config: RunnableConfig = {
             "configurable": {"thread_id": session_id},
@@ -580,10 +584,15 @@ class LangGraphAgent:
                 graph.aget_state(config),
                 memory_service.search(user_id, messages[-1].content),
             )
-            # step 3: check if interrupt
-            if state.next: # return empty if not interrupt
+            # step 3: pick how to enter the graph. state.next alone can't tell an
+            # ask_human pause from a run that died mid-flight, so check for a real interrupt.
+            if pending_interrupt_value(state) is not None:
                 logger.info("resuming_interrupted_graph", session_id=session_id, next_nodes=state.next)
                 response = await graph.ainvoke(Command(resume=messages[-1].content), config=config)
+            elif is_orphaned_run_for(state, messages):
+                # dropped connection: continue from the last checkpoint, don't start a new turn
+                logger.info("continuing_orphaned_run", session_id=session_id, next_nodes=state.next)
+                response = await graph.ainvoke(None, config=config)
             else:         # step 4: graph.invoke()
                 relevant_memory = relevant_memory or "No relevant memory found."
                 response = await graph.ainvoke(
@@ -599,9 +608,8 @@ class LangGraphAgent:
                 )
             # step 5: check if graph was interrupted during this invocation
 
-            state = await graph.aget_state(config)
-            if state.next:
-                interrupt_value = state.tasks[0].interrupts[0].value if state.tasks else "Waiting for input."
+            interrupt_value = pending_interrupt_value(await graph.aget_state(config))
+            if interrupt_value is not None:
                 logger.info("graph_interrupted", session_id=session_id, interrupt_value=str(interrupt_value))
                 return [Message(role="assistant", content=str(interrupt_value))]
 
@@ -609,8 +617,7 @@ class LangGraphAgent:
             asyncio.create_task(memory_service.add(user_id, openai_msgs, config.get("metadata")))
             return self.__process_messages(response["messages"])
         except GraphInterrupt:
-            state = await graph.aget_state(config)
-            interrupt_value = state.tasks[0].interrupts[0].value if state.tasks else "Waiting for input."
+            interrupt_value = pending_interrupt_value(await graph.aget_state(config)) or "Waiting for input."
             logger.info("graph_interrupted", session_id=session_id, interrupt_value=str(interrupt_value))
             return [Message(role="assistant", content=str(interrupt_value))]
         except Exception as e:
@@ -655,10 +662,13 @@ class LangGraphAgent:
                 memory_service.search(user_id, messages[-1].content),
             )
 
-            if state.next:
+            if pending_interrupt_value(state) is not None:
                 logger.info("resuming_interrupted_graph_stream", session_id=session_id, next_nodes=state.next)
                 graph_input = Command(resume=messages[-1].content)
-
+            elif is_orphaned_run_for(state, messages):
+                # dropped connection: continue from the last checkpoint, don't start a new turn
+                logger.info("continuing_orphaned_run_stream", session_id=session_id, next_nodes=state.next)
+                graph_input = None
             else:
                 relevant_memory = relevant_memory or "No relevant memory found."
                 graph_input = {
@@ -691,8 +701,8 @@ class LangGraphAgent:
                     yield text
             # After streaming completes, check for interrupt or update memory
             state = await graph.aget_state(config)
-            if state.next:
-                interrupt_value = state.tasks[0].interrupts[0].value if state.tasks else "Waiting for input."
+            interrupt_value = pending_interrupt_value(state)
+            if interrupt_value is not None:
                 logger.info("graph_interrupted_stream", session_id=session_id, interrupt_value=str(interrupt_value))
                 yield str(interrupt_value)
             elif state.values and "messages" in state.values:
@@ -700,13 +710,20 @@ class LangGraphAgent:
                 asyncio.create_task(memory_service.add(user_id, openai_msgs, config.get("metadata")))
 
         except GraphInterrupt:
-            state = await graph.aget_state(config)
-            interrupt_value = state.tasks[0].interrupts[0].value if state.tasks else "Waiting for input."
+            interrupt_value = pending_interrupt_value(await graph.aget_state(config)) or "Waiting for input."
             logger.info("graph_interrupted_stream", session_id=session_id, interrupt_value=str(interrupt_value))
             yield str(interrupt_value)
         except Exception as stream_error:
             logger.exception("stream_processing_failed", error=str(stream_error), session_id=session_id)
             raise stream_error
+
+    async def close(self) -> None:
+        """Close the checkpointer's Postgres connection pool (call once at app shutdown)."""
+        if self._connection_pool is not None:
+            await self._connection_pool.close()
+            self._connection_pool = None
+            self._graph = None
+            logger.info("connection_pool_closed")
 
     async def get_chat_history(self, session_id: str) -> list[Message]:
         """Get the chat history for a given thread ID.

@@ -155,6 +155,7 @@ class Settings:
         self.LLM_TOTAL_TIMEOUT = int(os.getenv("LLM_TOTAL_TIMEOUT", "60"))
         self.MAX_TOOL_CALLS_PER_TURN = int(os.getenv("MAX_TOOL_CALLS_PER_TURN", "5"))
         self.MAX_SUBTASKS = int(os.getenv("MAX_SUBTASKS", "4"))
+        self.RECURSION_LIMIT = int(os.getenv("RECURSION_LIMIT", "25"))
         self.MAX_TOOL_CALLS_PER_WORKER = int(os.getenv("MAX_TOOL_CALLS_PER_WORKER", "3"))
         self.TOOL_CALL_SIMILARITY_THRESHOLD = float(os.getenv("TOOL_CALL_SIMILARITY_THRESHOLD", "0.8"))
 
@@ -196,6 +197,14 @@ class Settings:
         self.VALKEY_DB = int(os.getenv("VALKEY_DB", "0"))
         self.VALKEY_PASSWORD = os.getenv("VALKEY_PASSWORD", "")
         self.VALKEY_MAX_CONNECTIONS = int(os.getenv("VALKEY_MAX_CONNECTIONS", "20"))
+
+        # Resumable chat streaming (see app/services/run_stream.py). Runs execute in the background and
+        # buffer their events, so a client that drops can re-attach and continue from its last event id.
+        # Without VALKEY_HOST the buffer is in-process: re-attach only works on the instance that owns the run.
+        self.STREAM_RUN_TTL_SECONDS = int(os.getenv("STREAM_RUN_TTL_SECONDS", "600"))  # keep a finished run's events
+        self.STREAM_RUN_MAX_SECONDS = int(os.getenv("STREAM_RUN_MAX_SECONDS", "600"))  # hard cap on one run
+        self.STREAM_LOCK_TTL_SECONDS = float(os.getenv("STREAM_LOCK_TTL_SECONDS", "30"))  # per-session run lease
+        self.STREAM_HEARTBEAT_SECONDS = float(os.getenv("STREAM_HEARTBEAT_SECONDS", "15"))  # SSE keep-alive interval
         self.CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", "60"))
 
         # Rate Limiting Configuration
@@ -216,6 +225,7 @@ class Settings:
         default_endpoints = {
             "chat": ["30 per minute"],
             "chat_stream": ["20 per minute"],
+            "chat_resume": ["60 per minute"],
             "messages": ["50 per minute"],
             "register": ["10 per hour"],
             "login": ["20 per minute"],
