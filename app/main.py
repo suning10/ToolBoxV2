@@ -64,13 +64,23 @@ async def lifespan(app: FastAPI):
     # Unlike the cache this is required for streaming, so it falls back to an in-process buffer
     # (rather than to nothing) if Valkey is configured but unreachable.
     await run_stream_service.initialize()
+    # Pre-warm mem0 AsyncMemory: initializes pgvector connection and schema check
+    # so the first search() cache miss or add() doesn't pay the ~130ms cold-init cost
     try:
         await memory_service.initialize()
     except Exception as e:
-        logger.warning("memory_warmup_failed_will_retry_on_first_use", error=str(e))
+        logger.exception("memory_service_pre_warm_failed", error=str(e))
+
+    yield
 
     # Builds the graph and its Postgres checkpointer. Raises in dev, degrades in production.
-    await agent.create_graph()
+    # Pre-warm the LangGraph agent: create graph + connection pool at startup
+    # to avoid cold-start latency on the first request
+    try:
+        await agent.create_graph()
+        logger.info("graph_pre_warmed")
+    except Exception as e:
+        logger.exception("graph_pre_warm_failed", error=str(e))
 
     try:
         yield
@@ -84,6 +94,9 @@ async def lifespan(app: FastAPI):
                 await agent.close()
             finally:
                 await cache_service.close()
+                if agent._connection_pool:
+                    await agent._connection_pool.close()
+                    logger.info("connection_pool_closed")
 
 
 app = FastAPI(
@@ -94,51 +107,66 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# Prometheus middleware + /metrics
+# Set up Prometheus metrics
 setup_metrics(app)
 
-# Starlette runs the last-added middleware outermost, so the correlation id is set
-# before anything that logs, and CORS answers preflights before the rest run.
-app.add_middleware(MetricsMiddleware)
+# Add logging context middleware (must be added before other middleware to capture context)
 app.add_middleware(LoggingContextMiddleware)
+
+# Add custom metrics middleware
+app.add_middleware(MetricsMiddleware)
+
+# Add profiling middleware (DEBUG only — saves HTML to /tmp on slow requests)
 if settings.DEBUG:
     app.add_middleware(ProfilingMiddleware)
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=settings.ALLOWED_ORIGINS,
-    # Never combine credentials with a wildcard origin
-    allow_credentials="*" not in settings.ALLOWED_ORIGINS,
-    allow_methods=["*"],
-    allow_headers=["*"],
-    expose_headers=["X-Run-Id"],  # so browser clients can read the run id needed to re-attach
-)
+
+# Add correlation ID middleware — must be outermost so request_id is set before all others
 app.add_middleware(CorrelationIdMiddleware)
 
+# Set up rate limiter exception handler
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)  # pyright: ignore[reportArgumentType]
 
 
+# Add validation exception handler
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(request: Request, exc: RequestValidationError):
-    """Return validation failures as a flat, client-friendly 422.
+    """Handle validation errors from request data.
 
     Args:
-        request: The request that failed validation.
-        exc: The validation error raised by FastAPI.
+        request: The request that caused the validation error
+        exc: The validation error
 
     Returns:
-        JSONResponse: A 422 listing each offending field and why.
+        JSONResponse: A formatted error response
     """
-    errors = [
-        {"field": ".".join(str(part) for part in error["loc"] if part != "body"), "message": error["msg"]}
-        for error in exc.errors()
-    ]
-    logger.warning("validation_error", path=request.url.path, error_count=len(errors))
-    return JSONResponse(
-        status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-        content={"detail": "Validation error", "errors": errors},
+    # Log the validation error
+    logger.error(
+        "validation_error",
+        client_host=request.client.host if request.client else "unknown",
+        path=request.url.path,
+        errors=str(exc.errors()),
     )
 
+    # Format the errors to be more user-friendly
+    formatted_errors = []
+    for error in exc.errors():
+        loc = " -> ".join([str(loc_part) for loc_part in error["loc"] if loc_part != "body"])
+        formatted_errors.append({"field": loc, "message": error["msg"]})
+
+    return JSONResponse(
+        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+        content={"detail": "Validation error", "errors": formatted_errors},
+    )
+
+# Set up CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=settings.ALLOWED_ORIGINS,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 app.include_router(api_router, prefix=settings.API_V1_STR)
 
@@ -146,42 +174,41 @@ app.include_router(api_router, prefix=settings.API_V1_STR)
 @app.get("/")
 @limiter.limit(settings.RATE_LIMIT_ENDPOINTS["root"][0])
 async def root(request: Request):
-    """Root endpoint.
-
-    Args:
-        request: The request object, required for rate limiting.
-
-    Returns:
-        dict: Basic service information.
-    """
+    """Root endpoint returning basic API information."""
     logger.info("root_endpoint_called")
     return {
         "name": settings.PROJECT_NAME,
         "version": settings.VERSION,
+        "status": "healthy",
         "environment": settings.ENVIRONMENT.value,
-        "docs_url": "/docs",
+        "swagger_url": "/docs",
+        "redoc_url": "/redoc",
     }
 
 
 @app.get("/health")
 @limiter.limit(settings.RATE_LIMIT_ENDPOINTS["health"][0])
-async def health_check(request: Request):
-    """Report service health, including database connectivity.
-
-    Args:
-        request: The request object, required for rate limiting.
+async def health_check(request: Request) -> JSONResponse:
+    """Health check endpoint with environment-specific information.
 
     Returns:
-        JSONResponse: 200 when the database is reachable, 503 otherwise.
+        JSONResponse: Health status payload, with HTTP 503 when the
+        database is unreachable so load balancers can drop the instance.
     """
+    logger.info("health_check_called")
+
+    # Check database connectivity
     db_healthy = await database_service.health_check()
-    return JSONResponse(
-        status_code=status.HTTP_200_OK if db_healthy else status.HTTP_503_SERVICE_UNAVAILABLE,
-        content={
-            "status": "healthy" if db_healthy else "degraded",
-            "version": settings.VERSION,
-            "environment": settings.ENVIRONMENT.value,
-            "components": {"api": "healthy", "database": "healthy" if db_healthy else "unhealthy"},
-            "timestamp": datetime.now().isoformat(),
-        },
-    )
+
+    response = {
+        "status": "healthy" if db_healthy else "degraded",
+        "version": settings.VERSION,
+        "environment": settings.ENVIRONMENT.value,
+        "components": {"api": "healthy", "database": "healthy" if db_healthy else "unhealthy"},
+        "timestamp": datetime.now().isoformat(),
+    }
+
+    # If DB is unhealthy, set the appropriate status code
+    status_code = status.HTTP_200_OK if db_healthy else status.HTTP_503_SERVICE_UNAVAILABLE
+
+    return JSONResponse(content=response, status_code=status_code)
